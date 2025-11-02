@@ -1,0 +1,23 @@
+# Core ML and data science
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.0
+joblib==1.4.2
+
+# Time series and optimization
+scipy==1.13.1
+pulp==2.8.0          # Linear optimization (for energy usage optimization)
+statsmodels==0.14.2  # Optional for trend analysis
+
+# Model serving / API
+fastapi==0.111.0
+uvicorn==0.30.1
+
+# Visualization (optional, for Jupyter / analytics)
+matplotlib==3.9.0
+
+# Logging and monitoring
+loguru==0.7.2
+
+# For notebook experimentation (optional)
+jupyter==1.1.0
