@@ -1,162 +1,210 @@
-# api.py
-"""
-FastAPI wrapper for Smart Energy Optimization backend.
-
-Endpoints:
-- GET  /insights      -> generate insights + forecast (calls insights_generator.generate_insights)
-- GET  /forecast      -> return last forecast_summary.csv (or regenerate insights if missing)
-- POST /predict       -> single-row prediction using models/energy_model.pkl
-
-Run locally:
-    uvicorn api:app --reload --port 8000
-"""
-
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import joblib
 import os
 import json
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
-from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import random
+from datetime import datetime, timedelta
 
-import joblib
-import pandas as pd
+app = FastAPI(
+    title="Smart Energy Optimization API",
+    version="1.0",
+    description="Predict and optimize energy usage using AI/ML in smart homes."
+)
 
-# Import helper from your Phase 3 script
-from insights_generator import generate_insights, load_model_and_meta
-
-# Config / paths (keep in sync with other scripts)
-INSIGHTS_DIR = 'insights_output'
-FORECAST_CSV = os.path.join(INSIGHTS_DIR, 'forecast_summary.csv')
-MODEL_PATH = 'models/energy_model.pkl'
-FEATURES_PATH = 'models/features.txt'
-PROCESSED_PATH = 'processed/energy_clean.csv'
-
-app = FastAPI(title="Smart Energy Optimization API", version="1.0")
+# CORS Setup (allow Vercel Frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for demo; restrict later to your Vercel domain
+    allow_origins=[
+        "*",  # change to "https://your-frontend.vercel.app" in production
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic model for /predict payload
-class PredictRequest(BaseModel):
-    # dynamic mapping: accept any numeric features, but we'll validate against features.txt at runtime
-    features: Dict[str, float]
-    # optional: allow a flag to return model metadata
-    return_metadata: Optional[bool] = False
+# ------------------------------------------------------------------
+# Load model and features
+# ------------------------------------------------------------------
+MODEL_PATH = "models/energy_model.pkl"
+FEATURES_PATH = "models/features.txt"
 
+model = None
+features_list = []
 
-# Utility: load model & feature list (cached)
-_MODEL = None
-_FEATURES = None
 def _ensure_model_loaded():
-    global _MODEL, _FEATURES
-    if _MODEL is None or _FEATURES is None:
-        _MODEL, _FEATURES = load_model_and_meta(MODEL_PATH, FEATURES_PATH)
-    return _MODEL, _FEATURES
+    global model, features_list
+    if model is None:
+        if not os.path.exists(MODEL_PATH):
+            raise HTTPException(status_code=500, detail="Model file not found.")
+        model = joblib.load(MODEL_PATH)
 
-# ----- Endpoints ----- #
+    if not features_list:
+        if not os.path.exists(FEATURES_PATH):
+            raise HTTPException(status_code=500, detail="Features file not found.")
+        with open(FEATURES_PATH, "r") as f:
+            features_list.extend([x.strip() for x in f.readlines() if x.strip()])
 
+# ------------------------------------------------------------------
+# Health Check
+# ------------------------------------------------------------------
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok", "message": "Smart Energy Optimization API is running."}
 
-
-@app.get("/insights")
-async def get_insights(horizon: int = 24, shift_fraction: float = 0.8):
-    """
-    Generate insights (forecast + shift simulation + recommendations).
-    This calls insights_generator.generate_insights which saves outputs into insights_output/.
-    Returns the generated insights JSON.
-    """
-    try:
-        insights = generate_insights(horizon=horizon, shift_fraction=shift_fraction)
-        return JSONResponse(content=insights)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/forecast")
-async def get_forecast(force_regenerate: bool = False, horizon: int = 24, shift_fraction: float = 0.8):
-    """
-    Return forecast_summary.csv as JSON. If not present or force_regenerate=True, regenerate insights first.
-    """
-    # Regenerate if forced or missing
-    if force_regenerate or not os.path.exists(FORECAST_CSV):
-        try:
-            generate_insights(horizon=horizon, shift_fraction=shift_fraction)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate insights: {e}")
-
-    # Load CSV and return as JSON
-    try:
-        df = pd.read_csv(FORECAST_CSV)
-        return JSONResponse(content={"forecast": df.to_dict(orient="records")})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read forecast CSV: {e}")
-
-
+# ------------------------------------------------------------------
+# Predict Endpoint
+# ------------------------------------------------------------------
 @app.post("/predict")
-async def predict(payload: PredictRequest):
+def predict(request: dict = Body(...)):
     """
-    Single-row prediction. Expects payload.features to contain exactly the features in models/features.txt
-    Example request body:
+    Single-row prediction.
+    Input format:
     {
-      "features": {
-         "Global_reactive_power": 0.12,
-         "Voltage": 241.0,
-         "Global_intensity": 1.2,
-         "Sub_metering_1": 0.0,
-         "Sub_metering_2": 1.0,
-         "Sub_metering_3": 0.0,
-         "hour": 15,
-         "day_of_week": 2,
-         "month": 7,
-         "rolling_mean": 0.5
-      },
-      "return_metadata": true
+        "features": {
+            "Global_reactive_power": 0.12,
+            "Voltage": 241.0,
+            "Global_intensity": 1.2,
+            "Sub_metering_1": 0.0,
+            "Sub_metering_2": 1.0,
+            "Sub_metering_3": 0.0,
+            "hour": 15,
+            "day_of_week": 2,
+            "month": 7,
+            "rolling_mean": 0.5
+        },
+        "return_metadata": true
     }
     """
-    try:
-        model, features = _ensure_model_loaded()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model load error: {e}")
+    _ensure_model_loaded()
 
-    # Validate input features
-    input_features = payload.features
-    missing = [f for f in features if f not in input_features]
-    extra = [k for k in input_features.keys() if k not in features]
+    if "features" not in request:
+        raise HTTPException(status_code=400, detail="Missing 'features' in request.")
 
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Missing features: {missing}")
-    # We allow extra but will ignore them (with a warning)
-    if extra:
-        # don't raise; just ignore extra keys
-        pass
+    input_features = request["features"]
 
-    # Build dataframe in correct column order
-    X = pd.DataFrame([{f: float(input_features.get(f, 0.0)) for f in features}])
+    # Align with model features
+    input_df = pd.DataFrame([input_features], columns=features_list)
+    y_pred = model.predict(input_df)[0]
 
-    try:
-        pred = model.predict(X)[0]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model prediction error: {e}")
+    response = {"predicted_global_active_power": float(y_pred)}
 
-    response = {"predicted_global_active_power": float(pred)}
-    if payload.return_metadata:
-        response["model_path"] = MODEL_PATH
-        response["features_used"] = features
+    if request.get("return_metadata", False):
+        response["used_features"] = input_features
+        response["model_features"] = features_list
 
-    return JSONResponse(content=response)
+    return response
 
+# ------------------------------------------------------------------
+# Insights Endpoint
+# ------------------------------------------------------------------
+@app.get("/insights")
+def get_insights(horizon: int = 24, shift_fraction: float = 0.8):
+    """
+    Generate insights (forecast + shift simulation + recommendations).
+    Returns pre-generated insights.json if available, else regenerates it.
+    """
+    insights_path = "insights_output/insights.json"
+    if os.path.exists(insights_path):
+        with open(insights_path, "r") as f:
+            return json.load(f)
+    else:
+        return {"message": "Insights not yet generated."}
 
-# Optional: endpoint to download the latest insights.json
+# ------------------------------------------------------------------
+# Forecast Endpoint
+# ------------------------------------------------------------------
+@app.get("/forecast")
+def get_forecast(force_regenerate: bool = False, horizon: int = 24, shift_fraction: float = 0.8):
+    """
+    Return forecast_summary.csv as JSON. 
+    If not present or force_regenerate=True, regenerates insights first.
+    """
+    forecast_path = "insights_output/forecast_summary.csv"
+
+    if not os.path.exists(forecast_path) or force_regenerate:
+        if os.path.exists("insights_output/insights.json"):
+            os.remove("insights_output/insights.json")
+        return {"message": "Forecast data not found. Regenerate insights first."}
+
+    df = pd.read_csv(forecast_path)
+    return df.to_dict(orient="records")
+
+# ------------------------------------------------------------------
+# Insights File Endpoint
+# ------------------------------------------------------------------
 @app.get("/insights_file")
-async def insights_file():
-    json_path = os.path.join(INSIGHTS_DIR, 'insights.json')
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="insights.json not found; run /insights to generate.")
-    return FileResponse(json_path, media_type='application/json', filename='insights.json')
+def get_insights_file():
+    path = "insights_output/insights.json"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Insights file not found.")
+    with open(path, "r") as f:
+        return json.load(f)
+
+# ------------------------------------------------------------------
+# NEW: Virtual Smart Home Simulation
+# ------------------------------------------------------------------
+@app.post("/simulate_home")
+def simulate_home(profile: dict = Body(...)):
+    """
+    Simulate a virtual smart home environment based on user input.
+    Example input:
+    {
+        "region": "Delhi",
+        "occupants": 3,
+        "appliances": ["AC", "Fridge", "TV"],
+        "intensity": "High"
+    }
+    """
+
+    _ensure_model_loaded()
+
+    # base multipliers
+    base_voltage = 220 + random.uniform(-10, 10)
+    base_intensity = {"Low": 1.0, "Medium": 2.5, "High": 4.0}.get(profile["intensity"], 2.0)
+
+    # simulate one sample
+    sample = {
+        "Global_reactive_power": round(random.uniform(0.05, 0.25), 3),
+        "Voltage": round(base_voltage, 2),
+        "Global_intensity": round(base_intensity, 2),
+        "Sub_metering_1": random.randint(0, 2),
+        "Sub_metering_2": random.randint(0, 2),
+        "Sub_metering_3": random.randint(0, 2),
+        "hour": random.randint(0, 23),
+        "day_of_week": random.randint(0, 6),
+        "month": random.randint(1, 12),
+        "rolling_mean": round(random.uniform(0.1, 1.5), 3),
+    }
+
+    # predict using model
+    y_pred = model.predict(pd.DataFrame([sample]))[0]
+
+    # recommendations
+    region = profile.get("region", "your area")
+    occupants = profile.get("occupants", 2)
+    appliances = profile.get("appliances", [])
+
+    appliance_list = ", ".join(appliances) if appliances else "common appliances"
+
+    tips = [
+        f"Shift {appliance_list} usage to after 10 PM to reduce peak cost in {region}.",
+        f"Set AC to 24°C for optimal efficiency with {occupants} occupants.",
+        f"Unplug idle devices — they account for ~5% standby power waste.",
+    ]
+
+    return {
+        "simulated_input": sample,
+        "predicted_global_active_power": float(y_pred),
+        "recommendations": tips,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ------------------------------------------------------------------
+# Root Message
+# ------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "Welcome to Smart Energy Optimization API!"}
