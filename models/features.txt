@@ -1,0 +1,10 @@
+Global_reactive_power
+Voltage
+Global_intensity
+Sub_metering_1
+Sub_metering_2
+Sub_metering_3
+hour
+day_of_week
+month
+rolling_mean
